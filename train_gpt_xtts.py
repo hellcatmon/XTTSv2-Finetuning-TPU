@@ -1,5 +1,13 @@
 import os
 import gc
+import torch
+try:
+    import torch_xla
+    import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.parallel_loader as pl
+    TPU_AVAILABLE = True
+except ImportError:
+    TPU_AVAILABLE = False
 
 from trainer import Trainer, TrainerArgs
 
@@ -23,9 +31,9 @@ def create_xtts_trainer_parser():
                         help="train_csv_path,eval_csv_path,language")
     parser.add_argument("--num_epochs", type=int, default=1,
                         help="Number of epochs")
-    parser.add_argument("--batch_size", type=int, default=1,
-                        help="Mini batch size")
-    parser.add_argument("--grad_acumm", type=int, default=1,
+    parser.add_argument("--batch_size", type=int, default=8,
+                        help="Mini batch size (will be automatically adjusted for TPU)")
+    parser.add_argument("--grad_acumm", type=int, default=4,
                         help="Grad accumulation steps")
     parser.add_argument("--max_audio_length", type=int, default=255995,
                         help="Max audio length")
@@ -34,15 +42,47 @@ def create_xtts_trainer_parser():
     parser.add_argument("--weight_decay", type=float, default=1e-2,
                         help="Weight decay")
     parser.add_argument("--lr", type=float, default=5e-6,
-                        help="Learning rate")
+                        help="Learning rate (will be automatically scaled for TPU)")
     parser.add_argument("--save_step", type=int, default=5000,
                         help="Save step")
+    parser.add_argument("--device_type", type=str, default="gpu", choices=["gpu", "tpu"],
+                        help="Device type for training (gpu or tpu)")
 
     return parser
 
 
 
-def train_gpt(metadatas, num_epochs, batch_size, grad_acumm, output_path, max_audio_length, max_text_length, lr, weight_decay, save_step):
+def train_gpt(metadatas, num_epochs, batch_size, grad_acumm, output_path, max_audio_length, max_text_length, lr, weight_decay, save_step, device_type):
+    # Validate device type
+    if device_type == "tpu" and not TPU_AVAILABLE:
+        raise RuntimeError("TPU training requested but torch_xla is not available. Please install TPU dependencies.")
+    
+    # TPU-specific optimizations
+    if device_type == "tpu":
+        # Ensure batch size is a multiple of 8 for TPU
+        batch_size = ((batch_size + 7) // 8) * 8
+        print(f"Adjusted batch size to {batch_size} for TPU optimization")
+        
+        # Scale learning rate based on batch size
+        # Using square root scaling rule
+        base_batch_size = 4  # baseline batch size for GPU
+        lr_scale_factor = (batch_size / base_batch_size) ** 0.5
+        lr = lr * lr_scale_factor
+        print(f"Scaled learning rate to {lr:.2e} for TPU batch size")
+        
+        # TPU-specific settings
+        OPTIMIZER_WD_ONLY_ON_WEIGHTS = False
+        device = xm.xla_device()
+        
+        # Add TPU-specific logging
+        print("TPU Training Configuration:")
+        print(f"- Batch Size: {batch_size}")
+        print(f"- Learning Rate: {lr:.2e}")
+        print(f"- Gradient Accumulation Steps: {grad_acumm}")
+    else:
+        OPTIMIZER_WD_ONLY_ON_WEIGHTS = True
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
     #  Logging parameters
     RUN_NAME = "GPT_XTTS_FT"
     PROJECT_NAME = "XTTS_trainer"
@@ -54,7 +94,6 @@ def train_gpt(metadatas, num_epochs, batch_size, grad_acumm, output_path, max_au
     OUT_PATH = output_path
 
     # Training Parameters
-    OPTIMIZER_WD_ONLY_ON_WEIGHTS = True  # for multi-gpu training please make it False
     START_WITH_EVAL = False  # if True it will star with evaluation
     BATCH_SIZE = batch_size  # set here the batch size
     GRAD_ACUMM_STEPS = grad_acumm  # set here the grad accumulation steps
@@ -158,7 +197,7 @@ def train_gpt(metadatas, num_epochs, batch_size, grad_acumm, output_path, max_au
     config.dashboard_logger = DASHBOARD_LOGGER
     config.logger_uri = LOGGER_URI
     config.audio = audio_config
-    config.batch_size = BATCH_SIZE
+    config.batch_size = batch_size
     config.num_loader_workers = 4
     config.eval_split_max_size = 256
     config.print_step = 50
@@ -170,7 +209,12 @@ def train_gpt(metadatas, num_epochs, batch_size, grad_acumm, output_path, max_au
     config.print_eval = False
     config.optimizer = "AdamW"
     config.optimizer_wd_only_on_weights = OPTIMIZER_WD_ONLY_ON_WEIGHTS
-    config.optimizer_params = {"betas": [0.9, 0.96], "eps": 1e-8, "weight_decay": weight_decay}
+    config.optimizer_params = {
+        "betas": [0.9, 0.96],
+        "eps": 1e-8,
+        "weight_decay": weight_decay,
+        "foreach": None if device_type == "tpu" else True
+    }
     config.lr = lr
     config.lr_scheduler = "MultiStepLR"
     config.lr_scheduler_params = {"milestones": [
@@ -191,13 +235,13 @@ def train_gpt(metadatas, num_epochs, batch_size, grad_acumm, output_path, max_au
     # init the trainer and 🚀
     trainer = Trainer(
         TrainerArgs(
-            restore_path=None,  # xtts checkpoint is restored via xtts_checkpoint key so no need of restore it using Trainer restore_path parameter
+            restore_path=None,
             skip_train_epoch=False,
             start_with_eval=START_WITH_EVAL,
-            grad_accum_steps=GRAD_ACUMM_STEPS
+            grad_accum_steps=GRAD_ACUMM_STEPS,
+            use_tpu=device_type == "tpu"
         ),
         config,
-        #output_path=os.path.join(output_path, "run", "training"),
         output_path=os.path.join(output_path),
         model=model,
         train_samples=train_samples,
@@ -232,7 +276,8 @@ if __name__ == "__main__":
         lr=args.lr,
         max_text_length=args.max_text_length,
         max_audio_length=args.max_audio_length,
-        save_step=args.save_step
+        save_step=args.save_step,
+        device_type=args.device_type
     )
 
     print(f"Checkpoint saved in dir: {trainer_out_path}")

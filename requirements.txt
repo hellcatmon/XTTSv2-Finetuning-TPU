@@ -1,27 +1,10 @@
 # core deps
 numpy
-cython
-scipy
+pandas
+torch_xla
 torch
-torchaudio
-soundfile
-librosa
-scikit-learn
-numba
-inflect
-tqdm
-anyascii
-pyyaml
-fsspec
-aiohttp
-packaging
-mutagen
-# deps for examples
-flask
-# deps for inference
-pysbd
-# deps for notebooks
-umap-learn
+tensorboard
+transformers
 pandas
 # deps for training
 matplotlib
@@ -56,3 +39,5 @@ spacy[ja]
 tokenizers
 vinorm
 underthesea
+phonemizer
+librosa
