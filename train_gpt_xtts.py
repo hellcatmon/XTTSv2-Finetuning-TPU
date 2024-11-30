@@ -240,14 +240,28 @@ def train_gpt(metadatas, num_epochs, batch_size, grad_acumm, output_path, max_au
     )
 
     # init the trainer and 🚀
+    trainer_args = TrainerArgs(
+        restore_path=None,
+        skip_train_epoch=False,
+        start_with_eval=START_WITH_EVAL,
+        grad_accum_steps=GRAD_ACUMM_STEPS,
+    )
+
+    # Configure TPU-specific settings in config instead
+    if device_type == "tpu":
+        config.use_tpu = True
+        config.device = device
+        # TPU-specific optimizations
+        config.num_loader_workers = 8
+        config.eval_split_max_size = 256
+        # Add any other TPU-specific config settings
+    else:
+        config.use_tpu = False
+        config.device = device
+        config.num_loader_workers = 4
+
     trainer = Trainer(
-        TrainerArgs(
-            restore_path=None,
-            skip_train_epoch=False,
-            start_with_eval=START_WITH_EVAL,
-            grad_accum_steps=GRAD_ACUMM_STEPS,
-            use_tpu=device_type == "tpu"
-        ),
+        trainer_args,
         config,
         output_path=os.path.join(output_path),
         model=model,
