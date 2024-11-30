@@ -1,10 +1,17 @@
 import os
 import gc
 import torch
+
+# Set XLA flags before importing torch_xla
+os.environ['XLA_FLAGS'] = '--xla_gpu_cuda_data_dir=/usr/local/cuda'
+# Disable problematic flags
+os.environ['XLA_DISABLE_LATENCY_HIDING_SCHEDULER_RERUN'] = '1'
+
 try:
-    import torch_xla
+    # Import TPU-specific modules
     import torch_xla.core.xla_model as xm
     import torch_xla.distributed.parallel_loader as pl
+    from torch_xla.distributed import xla_backend
     TPU_AVAILABLE = True
 except ImportError:
     TPU_AVAILABLE = False

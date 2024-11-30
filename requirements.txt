@@ -5,6 +5,7 @@ torch_xla
 torch
 tensorboard
 transformers
+mutagen
 pandas
 # deps for training
 matplotlib
