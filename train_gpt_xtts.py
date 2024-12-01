@@ -59,37 +59,37 @@ def create_xtts_trainer_parser():
 
 
 
-def train_gpt(metadatas, num_epochs, batch_size, grad_acumm, output_path, max_audio_length, max_text_length, lr, weight_decay, save_step, device_type):
+def train_gpt(metadatas, num_epochs, batch_size, grad_acumm, output_path, max_audio_length, max_text_length, lr, weight_decay, save_step, device_type, rank=None):
     # Validate device type
     if device_type == "tpu" and not TPU_AVAILABLE:
-        raise RuntimeError("TPU training requested but torch_xla is not available. Please install TPU dependencies.")
+        raise RuntimeError("TPU training requested but torch_xla is not available")
     
     # TPU-specific optimizations
     if device_type == "tpu":
         # Ensure batch size is a multiple of 8 for TPU
         batch_size = ((batch_size + 7) // 8) * 8
-        print(f"Adjusted batch size to {batch_size} for TPU optimization")
+        if rank == 0:  # Only print from master process
+            print(f"Adjusted batch size to {batch_size} for TPU optimization")
         
         # Scale learning rate based on batch size
-        # Using square root scaling rule
-        base_batch_size = 4  # baseline batch size for GPU
+        base_batch_size = 4
         lr_scale_factor = (batch_size / base_batch_size) ** 0.5
         lr = lr * lr_scale_factor
-        print(f"Scaled learning rate to {lr:.2e} for TPU batch size")
+        if rank == 0:
+            print(f"Scaled learning rate to {lr:.2e} for TPU batch size")
         
-        # TPU-specific settings
         OPTIMIZER_WD_ONLY_ON_WEIGHTS = False
         device = xm.xla_device()
         
-        # Add TPU-specific logging
-        print("TPU Training Configuration:")
-        print(f"- Batch Size: {batch_size}")
-        print(f"- Learning Rate: {lr:.2e}")
-        print(f"- Gradient Accumulation Steps: {grad_acumm}")
+        if rank == 0:
+            print("TPU Training Configuration:")
+            print(f"- Batch Size: {batch_size}")
+            print(f"- Learning Rate: {lr:.2e}")
+            print(f"- Gradient Accumulation Steps: {grad_acumm}")
     else:
         OPTIMIZER_WD_ONLY_ON_WEIGHTS = True
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+
     #  Logging parameters
     RUN_NAME = "GPT_XTTS_FT"
     PROJECT_NAME = "XTTS_trainer"
@@ -125,7 +125,6 @@ def train_gpt(metadatas, num_epochs, batch_size, grad_acumm, output_path, max_au
 
     # Define the path where XTTS v2.0.1 files will be downloaded
     CHECKPOINTS_OUT_PATH = os.path.join(OUT_PATH, "XTTS_v2.0_original_model_files/")
-    os.makedirs(CHECKPOINTS_OUT_PATH, exist_ok=True)
 
     # DVAE files
     DVAE_CHECKPOINT_LINK = "https://coqui.gateway.scarf.sh/hf-coqui/XTTS-v2/main/dvae.pth"
@@ -247,14 +246,16 @@ def train_gpt(metadatas, num_epochs, batch_size, grad_acumm, output_path, max_au
         grad_accum_steps=GRAD_ACUMM_STEPS,
     )
 
-    # Configure TPU-specific settings in config instead
+    # Only create directories from master process
+    if device_type != "tpu" or rank == 0:
+        os.makedirs(CHECKPOINTS_OUT_PATH, exist_ok=True)
+
+    # Configure TPU-specific settings
     if device_type == "tpu":
         config.use_tpu = True
         config.device = device
-        # TPU-specific optimizations
         config.num_loader_workers = 8
         config.eval_split_max_size = 256
-        # Add any other TPU-specific config settings
     else:
         config.use_tpu = False
         config.device = device
@@ -270,23 +271,23 @@ def train_gpt(metadatas, num_epochs, batch_size, grad_acumm, output_path, max_au
     )
     trainer.fit()
 
-    # get the longest text audio file to use as speaker reference
-    samples_len = [len(item["text"].split(" ")) for item in train_samples]
-    longest_text_idx =  samples_len.index(max(samples_len))
-    speaker_ref = train_samples[longest_text_idx]["audio_file"]
+    # Only process final steps on master process
+    if device_type != "tpu" or rank == 0:
+        samples_len = [len(item["text"].split(" ")) for item in train_samples]
+        longest_text_idx = samples_len.index(max(samples_len))
+        speaker_ref = train_samples[longest_text_idx]["audio_file"]
+        trainer_out_path = trainer.output_path
+    else:
+        trainer_out_path = None
 
-    trainer_out_path = trainer.output_path
-
-    # deallocate VRAM and RAM
+    # Cleanup
     del model, trainer, train_samples, eval_samples
     gc.collect()
 
     return trainer_out_path
 
-if __name__ == "__main__":
-    parser = create_xtts_trainer_parser()
-    args = parser.parse_args()
-
+def _mp_fn(rank, args):
+    """Function to be run on each TPU core"""
     trainer_out_path = train_gpt(
         metadatas=args.metadatas,
         output_path=args.output_path,
@@ -298,7 +299,32 @@ if __name__ == "__main__":
         max_text_length=args.max_text_length,
         max_audio_length=args.max_audio_length,
         save_step=args.save_step,
-        device_type=args.device_type
+        device_type=args.device_type,
+        rank=rank
     )
 
-    print(f"Checkpoint saved in dir: {trainer_out_path}")
+    if rank == 0:  # Only print from master process
+        print(f"Checkpoint saved in dir: {trainer_out_path}")
+
+if __name__ == "__main__":
+    parser = create_xtts_trainer_parser()
+    args = parser.parse_args()
+
+    if args.device_type == "tpu":
+        import torch_xla.distributed.xla_multiprocessing as xmp
+        xmp.spawn(_mp_fn, args=(args,), nprocs=8)  # Use 8 TPU cores
+    else:
+        trainer_out_path = train_gpt(
+            metadatas=args.metadatas,
+            output_path=args.output_path,
+            num_epochs=args.num_epochs,
+            batch_size=args.batch_size,
+            grad_acumm=args.grad_acumm,
+            weight_decay=args.weight_decay,
+            lr=args.lr,
+            max_text_length=args.max_text_length,
+            max_audio_length=args.max_audio_length,
+            save_step=args.save_step,
+            device_type=args.device_type
+        )
+        print(f"Checkpoint saved in dir: {trainer_out_path}")
